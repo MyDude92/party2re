@@ -90,8 +90,8 @@ func wireHooks(
 	})
 
 	cmbt.boss.SetVictoryBanquetHook(func(ctx context.Context, bossID, bossName, slayerID, slayerName string, tier int) error {
-		_, hookErr := misc.eventplaza.RecordVictoryBanquet(ctx, bossID, bossName, slayerID, slayerName, tier)
-		return hookErr
+		_, err := misc.eventplaza.RecordVictoryBanquet(ctx, bossID, bossName, slayerID, slayerName, tier)
+		return err
 	})
 
 	misc.casino.SetGamePlayedHook(func(ctx context.Context, characterID string, gameName string) error {
@@ -137,7 +137,8 @@ func wireHooks(
 	}
 	if misc.tavern != nil {
 		soc.home.SetFullnessResetter(misc.tavern)
-		deliveryHook := func(ctx context.Context, characterID string) error {
+		postAdventureHook := func(ctx context.Context, characterID string) error {
+			_ = misc.tavern.ResetFullness(ctx, characterID)
 			_, err := misc.tavern.ClaimDelivery(ctx, characterID)
 			if errors.Is(err, tavern.ErrNoActiveDelivery) || errors.Is(err, tavern.ErrInsufficientFunds) {
 				return nil
@@ -145,10 +146,10 @@ func wireHooks(
 			return err
 		}
 		if cmbt.adv != nil {
-			cmbt.adv.SetPostAdventureHook(deliveryHook)
+			cmbt.adv.SetPostAdventureHook(postAdventureHook)
 		}
 		if cmbt.party != nil {
-			cmbt.party.SetPostAdventureHook(deliveryHook)
+			cmbt.party.SetPostAdventureHook(postAdventureHook)
 		}
 	}
 	if misc.chapel != nil {
