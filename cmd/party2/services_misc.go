@@ -242,9 +242,14 @@ func newMiscServices(
 	if err != nil {
 		return nil, err
 	}
-	casinoRoomRepo, err := database.NewCasinoRoomRepository(db)
-	if err != nil {
-		return nil, err
+	var casinoRoomRepo casino.RoomRepository
+	if valkeyClient != nil {
+		casinoRoomRepo, err = casino.NewValkeyRoomRepository(valkeyClient, casino.WithValkeyCharacterRepository(core.charRepo))
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		casinoRoomRepo = casino.NewMemoryRoomRepository()
 	}
 	casinoService, err := casino.NewService(
 		casinoRepo,
