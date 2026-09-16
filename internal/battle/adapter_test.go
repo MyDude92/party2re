@@ -643,16 +643,19 @@ func TestApplyPostBattleResult_MultiCharacterPartyWithProvider(t *testing.T) {
 			"char-alpha": {{ID: "item-001", Quantity: 1}},
 		},
 		TotalReward: corebattle.Reward{
-			Experience:       100,
-			Currency:         600,
-			ItemDefinitionID: "item-drop-rare",
-			ItemQuantity:     1,
+			Experience: 100,
+			Currency:   600,
 		},
 	}
 
 	req := battle.ApplyPostBattleRequest{
 		CharacterIDs: charIDs,
 		BattleResult: battleRes,
+		RecipientDrops: map[string][]string{
+			"char-alpha": {"item-drop-rare"},
+			"char-beta":  {"item-drop-rare"},
+			"char-gamma": {"item-drop-rare"},
+		},
 	}
 
 	resp, err := svc.ApplyPostBattleResult(ctx, req)

@@ -117,6 +117,7 @@ func TestApplyPostBattleResult_MultiCharacter_FullDepot_LostDrops(t *testing.T) 
 		ID:       "char-multi-1",
 		Name:     "PartyLeader",
 		JobID:    "job-warrior",
+		Level:    1,
 		Stats:    corecharacter.Stats{HP: 100, MaxHP: 100},
 		JobLevel: 1,
 	}
@@ -124,6 +125,7 @@ func TestApplyPostBattleResult_MultiCharacter_FullDepot_LostDrops(t *testing.T) 
 		ID:       "char-multi-2",
 		Name:     "PartyMember",
 		JobID:    "job-mage",
+		Level:    1,
 		Stats:    corecharacter.Stats{HP: 80, MaxHP: 80},
 		JobLevel: 1,
 	}
@@ -182,7 +184,10 @@ func TestApplyPostBattleResult_MultiCharacter_FullDepot_LostDrops(t *testing.T) 
 	req := battle.ApplyPostBattleRequest{
 		CharacterIDs: []string{"char-multi-1", "char-multi-2"},
 		BattleResult: battleRes,
-		DropItems:    []string{"shared-drop-item"},
+		RecipientDrops: map[string][]string{
+			"char-multi-1": {"drop-item-1"},
+			"char-multi-2": {"drop-item-2"},
+		},
 	}
 
 	resp, err := svc.ApplyPostBattleResult(ctx, req)
@@ -194,13 +199,13 @@ func TestApplyPostBattleResult_MultiCharacter_FullDepot_LostDrops(t *testing.T) 
 	if len(resp.DepotDeliveries["char-multi-1"]) != 0 {
 		t.Errorf("c1 expected 0 depot deliveries, got %d", len(resp.DepotDeliveries["char-multi-1"]))
 	}
-	if len(resp.LostDrops["char-multi-1"]) != 1 || resp.LostDrops["char-multi-1"][0].DefinitionID != "shared-drop-item" {
-		t.Errorf("c1 expected 1 lost drop (shared-drop-item), got %+v", resp.LostDrops["char-multi-1"])
+	if len(resp.LostDrops["char-multi-1"]) != 1 || resp.LostDrops["char-multi-1"][0].DefinitionID != "drop-item-1" {
+		t.Errorf("c1 expected 1 lost drop (drop-item-1), got %+v", resp.LostDrops["char-multi-1"])
 	}
 
 	// c2: depot has space -> delivery must be 1, lost must be 0
-	if len(resp.DepotDeliveries["char-multi-2"]) != 1 || resp.DepotDeliveries["char-multi-2"][0].DefinitionID != "shared-drop-item" {
-		t.Errorf("c2 expected 1 depot delivery (shared-drop-item), got %+v", resp.DepotDeliveries["char-multi-2"])
+	if len(resp.DepotDeliveries["char-multi-2"]) != 1 || resp.DepotDeliveries["char-multi-2"][0].DefinitionID != "drop-item-2" {
+		t.Errorf("c2 expected 1 depot delivery (drop-item-2), got %+v", resp.DepotDeliveries["char-multi-2"])
 	}
 	if len(resp.LostDrops["char-multi-2"]) != 0 {
 		t.Errorf("c2 expected 0 lost drops, got %d", len(resp.LostDrops["char-multi-2"]))
@@ -273,5 +278,189 @@ func TestApplyPostBattleResult_NilDepotRepo_LostDrops(t *testing.T) {
 	lost := resp.LostDrops["char-no-depot-svc"]
 	if len(lost) != 1 || lost[0].DefinitionID != "item-overflow-drop" {
 		t.Errorf("expected 1 lost drop (item-overflow-drop), got %+v", lost)
+	}
+}
+
+func TestApplyPostBattleResult_MultiCharacter_SingleRecipientDrop(t *testing.T) {
+	ctx := context.Background()
+	charRepo := newMockCharRepo()
+	invRepo := newMockInvRepo()
+	equipRepo := newMockEquipRepo()
+	depotRepo := newMockDepotRepo()
+
+	charIDs := []string{"char-p1", "char-p2", "char-p3", "char-p4"}
+	for _, id := range charIDs {
+		c := corecharacter.Character{
+			ID:       id,
+			Name:     id,
+			JobID:    "job-warrior",
+			Level:    1,
+			JobLevel: 1,
+			Stats:    corecharacter.Stats{HP: 100, MaxHP: 100},
+		}
+		_ = charRepo.Update(ctx, c)
+		inv, _ := coreinventory.New(id)
+		_ = invRepo.Save(ctx, inv)
+	}
+
+	txProv := &mockTxProvider{}
+	svc := battle.NewService(
+		battle.WithCharacterRepository(charRepo),
+		battle.WithInventoryRepository(invRepo),
+		battle.WithEquipmentRepository(equipRepo),
+		battle.WithDepotRepository(depotRepo),
+		battle.WithTransactionProvider(txProv),
+		battle.WithMaxInventoryCapacity(5),
+	)
+
+	battleRes := corebattle.PartyBattleResult{
+		Outcome:    corebattle.OutcomeWin,
+		WinnerSide: "allies",
+		RemainingHP: map[string]int{
+			"char-p1": 100,
+			"char-p2": 100,
+			"char-p3": 100,
+			"char-p4": 100,
+		},
+		TotalReward: corebattle.Reward{
+			Experience:       50,
+			Currency:         100,
+			ItemDefinitionID: "item-boss-sword",
+			ItemQuantity:     1,
+		},
+	}
+
+	// 1. Without RecipientCharacterID or RecipientDrops: default designated recipient is CharacterIDs[0] (char-p1)
+	req1 := battle.ApplyPostBattleRequest{
+		CharacterIDs: charIDs,
+		BattleResult: battleRes,
+	}
+	resp1, err := svc.ApplyPostBattleResult(ctx, req1)
+	if err != nil {
+		t.Fatalf("ApplyPostBattleResult failed: %v", err)
+	}
+	if len(resp1.InventoryDrops["char-p1"]) != 1 || resp1.InventoryDrops["char-p1"][0].DefinitionID != "item-boss-sword" {
+		t.Errorf("expected char-p1 to receive 1 item-boss-sword, got %+v", resp1.InventoryDrops["char-p1"])
+	}
+	for _, id := range []string{"char-p2", "char-p3", "char-p4"} {
+		if len(resp1.InventoryDrops[id]) != 0 {
+			t.Errorf("expected %s to receive 0 drops, got %d", id, len(resp1.InventoryDrops[id]))
+		}
+	}
+
+	// 2. With RecipientCharacterID explicitly specified (char-p3)
+	req2 := battle.ApplyPostBattleRequest{
+		CharacterIDs:         charIDs,
+		BattleResult:         battleRes,
+		RecipientCharacterID: "char-p3",
+	}
+	resp2, err := svc.ApplyPostBattleResult(ctx, req2)
+	if err != nil {
+		t.Fatalf("ApplyPostBattleResult failed: %v", err)
+	}
+	if len(resp2.InventoryDrops["char-p3"]) != 1 || resp2.InventoryDrops["char-p3"][0].DefinitionID != "item-boss-sword" {
+		t.Errorf("expected char-p3 to receive 1 item-boss-sword, got %+v", resp2.InventoryDrops["char-p3"])
+	}
+	for _, id := range []string{"char-p1", "char-p2", "char-p4"} {
+		if len(resp2.InventoryDrops[id]) != 0 {
+			t.Errorf("expected %s to receive 0 drops, got %d", id, len(resp2.InventoryDrops[id]))
+		}
+	}
+}
+
+func TestApplyPostBattleResult_ProgressionError_Propagated(t *testing.T) {
+	ctx := context.Background()
+	charRepo := newMockCharRepo()
+	invRepo := newMockInvRepo()
+	equipRepo := newMockEquipRepo()
+
+	// Level = 0 is invalid for progression (progression.ErrInvalidCharacterLevel)
+	char := corecharacter.Character{
+		ID:       "char-invalid-level",
+		Name:     "無効勇者",
+		JobID:    "job-warrior",
+		Level:    0, // invalid level triggers progression error
+		JobLevel: 1,
+		Stats:    corecharacter.Stats{HP: 100, MaxHP: 100},
+	}
+	_ = charRepo.Update(ctx, char)
+
+	txProv := &mockTxProvider{}
+	svc := battle.NewService(
+		battle.WithCharacterRepository(charRepo),
+		battle.WithInventoryRepository(invRepo),
+		battle.WithEquipmentRepository(equipRepo),
+		battle.WithTransactionProvider(txProv),
+	)
+
+	battleRes := corebattle.PartyBattleResult{
+		Outcome:    corebattle.OutcomeWin,
+		WinnerSide: "allies",
+		RemainingHP: map[string]int{
+			"char-invalid-level": 100,
+		},
+		TotalReward: corebattle.Reward{
+			Experience: 100,
+			Currency:   50,
+		},
+	}
+
+	req := battle.ApplyPostBattleRequest{
+		CharacterIDs: []string{"char-invalid-level"},
+		BattleResult: battleRes,
+	}
+
+	_, err := svc.ApplyPostBattleResult(ctx, req)
+	if err == nil {
+		t.Fatalf("expected progression error to be propagated, but got nil")
+	}
+}
+
+func TestApplyPostBattleResult_RemainingStatus(t *testing.T) {
+	ctx := context.Background()
+	charRepo := newMockCharRepo()
+	invRepo := newMockInvRepo()
+	equipRepo := newMockEquipRepo()
+
+	char := corecharacter.Character{
+		ID:       "char-status",
+		Name:     "状態異常勇者",
+		Level:    1,
+		JobLevel: 1,
+		Stats:    corecharacter.Stats{HP: 100, MaxHP: 100},
+	}
+	_ = charRepo.Update(ctx, char)
+
+	txProv := &mockTxProvider{}
+	svc := battle.NewService(
+		battle.WithCharacterRepository(charRepo),
+		battle.WithInventoryRepository(invRepo),
+		battle.WithEquipmentRepository(equipRepo),
+		battle.WithTransactionProvider(txProv),
+	)
+
+	battleRes := corebattle.PartyBattleResult{
+		Outcome:    corebattle.OutcomeWin,
+		WinnerSide: "allies",
+		RemainingHP: map[string]int{
+			"char-status": 50,
+		},
+		RemainingStatus: map[string]string{
+			"char-status": "poison",
+		},
+	}
+
+	req := battle.ApplyPostBattleRequest{
+		CharacterIDs: []string{"char-status"},
+		BattleResult: battleRes,
+	}
+
+	resp, err := svc.ApplyPostBattleResult(ctx, req)
+	if err != nil {
+		t.Fatalf("ApplyPostBattleResult failed: %v", err)
+	}
+
+	if resp.RemainingStatus == nil || resp.RemainingStatus["char-status"] != "poison" {
+		t.Errorf("expected RemainingStatus to contain poison, got: %+v", resp.RemainingStatus)
 	}
 }
