@@ -2,7 +2,6 @@ package battle
 
 import (
 	"context"
-	"errors"
 	"sort"
 	"strings"
 
@@ -11,17 +10,17 @@ import (
 	coreequipment "github.com/witchcraze/party2re/internal/core/equipment"
 	coreinventory "github.com/witchcraze/party2re/internal/core/inventory"
 	coreitem "github.com/witchcraze/party2re/internal/core/item"
-	"github.com/witchcraze/party2re/internal/core/job"
 	"github.com/witchcraze/party2re/internal/core/progression"
-	"github.com/witchcraze/party2re/internal/depot"
 	"github.com/witchcraze/party2re/internal/economy"
 )
 
 // ApplyPostBattleRequest specifies combatants, resolution, and additional rewards to persist.
 type ApplyPostBattleRequest struct {
-	CharacterIDs []string
-	BattleResult corebattle.PartyBattleResult
-	DropItems    []string // Extra dropped item definition IDs (e.g. stage/boss drops)
+	CharacterIDs         []string
+	BattleResult         corebattle.PartyBattleResult
+	DropItems            []string            // Extra dropped item definition IDs (e.g. stage/boss drops)
+	RecipientDrops       map[string][]string // Optional recipient-targeted drop item definition IDs (characterID -> []itemDefID)
+	RecipientCharacterID string              // Optional recipient character ID for DropItems / BattleResult.TotalReward drops
 }
 
 // ApplyPostBattleResponse contains the committed state for each participating character.
@@ -35,9 +34,10 @@ type ApplyPostBattleResponse struct {
 	DepotDeliveries   map[string][]coreitem.Instance
 	LostDrops         map[string][]coreitem.Instance
 	ConsumedItems     map[string][]corebattle.ConsumedItem
+	RemainingStatus   map[string]string
 }
 
-// ApplyPostBattleResult applies battle outcomes (HP, MP, CMP, status, consumed items, EXP, gold, drops)
+// ApplyPostBattleResult applies battle outcomes (HP, MP, fatigue, consumed items, EXP, gold, crystals, drops)
 // atomically adhering to the deterministic row-lock hierarchy (Rank 2: Character -> Rank 3: Inventory/Equip -> Rank 5: Depot).
 func (s *Service) ApplyPostBattleResult(ctx context.Context, req ApplyPostBattleRequest) (ApplyPostBattleResponse, error) {
 	if len(req.CharacterIDs) == 0 {
@@ -57,7 +57,7 @@ func (s *Service) ApplyPostBattleResult(ctx context.Context, req ApplyPostBattle
 }
 
 func (s *Service) applySingleCharacterWithRunner(ctx context.Context, charID string, req ApplyPostBattleRequest) (ApplyPostBattleResponse, error) {
-	resp := newApplyPostBattleResponse()
+	resp := newApplyPostBattleResponse(req.BattleResult)
 	txReq := economy.TransactionRequest{
 		CharacterID:   charID,
 		LockInventory: true,
@@ -73,7 +73,7 @@ func (s *Service) applySingleCharacterWithRunner(ctx context.Context, charID str
 			}
 		}
 
-		// 2. Apply status, HP, MP, CMP
+		// 2. Apply HP, MP, fatigue
 		s.applyResourceUpdates(&tc.Character, charID, req.BattleResult)
 
 		// 3. Process item consumption
@@ -89,12 +89,13 @@ func (s *Service) applySingleCharacterWithRunner(ctx context.Context, charID str
 
 		// 5. Apply victory rewards
 		if req.BattleResult.Outcome == corebattle.OutcomeWin {
+			charDrops := req.dropsForCharacter(charID)
 			gainedGold, gainedEXP, gainedCrystals, lvlRes, invDrops, depotDrops, err := s.applyRewardsForCharacter(
 				tc.Context,
 				&tc.Character,
 				&tc.Inventory,
 				req.BattleResult.TotalReward,
-				req.DropItems,
+				charDrops,
 			)
 			if err != nil {
 				return err
@@ -121,7 +122,7 @@ func (s *Service) applySingleCharacterWithRunner(ctx context.Context, charID str
 }
 
 func (s *Service) applyMultiCharacterWithProvider(ctx context.Context, sortedIDs []string, req ApplyPostBattleRequest) (ApplyPostBattleResponse, error) {
-	resp := newApplyPostBattleResponse()
+	resp := newApplyPostBattleResponse(req.BattleResult)
 
 	err := s.runInTx(ctx, func(txCtx context.Context) error {
 		// Phase 1: Lock characters in ascending lexicographical order (Rank 2)
@@ -175,12 +176,13 @@ func (s *Service) applyMultiCharacterWithProvider(ctx context.Context, sortedIDs
 			}
 
 			if req.BattleResult.Outcome == corebattle.OutcomeWin {
+				charDrops := req.dropsForCharacter(id)
 				gainedGold, gainedEXP, gainedCrystals, lvlRes, invDrops, depotDrops, err := s.applyRewardsForCharacter(
 					txCtx,
 					&char,
 					&inv,
 					req.BattleResult.TotalReward,
-					req.DropItems,
+					charDrops,
 				)
 				if err != nil {
 					return err
@@ -316,84 +318,6 @@ func (s *Service) applyConsumedItems(
 	return applied
 }
 
-func (s *Service) applyRewardsForCharacter(
-	ctx context.Context,
-	char *corecharacter.Character,
-	inv *coreinventory.Inventory,
-	reward corebattle.Reward,
-	extraDrops []string,
-) (int, int, int, progression.LevelUpResult, []coreitem.Instance, []coreitem.Instance, error) {
-	gainedGold := reward.Currency
-	_ = char.AddMoney(gainedGold)
-
-	gainedEXP := reward.Experience
-	var lvlRes progression.LevelUpResult
-	if gainedEXP > 0 {
-		opts := ExtractStatOrbOptions(*inv)
-		if s.skillProvider != nil && char.JobID != "" {
-			opts.JobSkills = s.skillProvider.SkillsForJob(char.JobID)
-		}
-		var jobDef job.Definition
-		if s.jobProvider != nil && char.JobID != "" {
-			if def, err := s.jobProvider.FindByID(char.JobID); err == nil {
-				jobDef = def
-			}
-		}
-		res, err := progression.ApplyExperienceWithJobFull(char, gainedEXP, jobDef, s.rng, opts)
-		if err == nil {
-			lvlRes = res
-		}
-	}
-
-	// Crystal rewards (_battle.cgi:145-150, 178-228)
-	gainedCrystals := reward.Crystals
-	if gainedCrystals > 0 {
-		char.Crystal += gainedCrystals
-		if char.Crystal > 999999 {
-			char.Crystal = 999999
-		}
-	}
-
-	// Item drop collection & depot fallback
-	var dropDefIDs []string
-	if reward.ItemDefinitionID != "" && reward.ItemQuantity > 0 {
-		for i := 0; i < reward.ItemQuantity; i++ {
-			dropDefIDs = append(dropDefIDs, reward.ItemDefinitionID)
-		}
-	}
-	dropDefIDs = append(dropDefIDs, extraDrops...)
-
-	var invDrops []coreitem.Instance
-	var depotDrops []coreitem.Instance
-
-	for _, defID := range dropDefIDs {
-		inst, err := coreitem.NewInstance(defID, 1)
-		if err != nil {
-			continue
-		}
-
-		// Check inventory capacity
-		if len(inv.Items) < s.maxInventoryCapacity() {
-			if err := inv.Add(inst); err == nil {
-				invDrops = append(invDrops, inst)
-				continue
-			}
-		}
-
-		// Overflow routes to depot
-		depotDrops = append(depotDrops, inst)
-	}
-
-	return gainedGold, gainedEXP, gainedCrystals, lvlRes, invDrops, depotDrops, nil
-}
-
-func (s *Service) maxInventoryCapacity() int {
-	if s.maxInvCap > 0 {
-		return s.maxInvCap
-	}
-	return 1 // Default 1 matching legacy $m{ite}
-}
-
 func deduplicateAndSortIDs(ids []string) []string {
 	seen := make(map[string]bool, len(ids))
 	result := make([]string, 0, len(ids))
@@ -408,7 +332,7 @@ func deduplicateAndSortIDs(ids []string) []string {
 	return result
 }
 
-func newApplyPostBattleResponse() ApplyPostBattleResponse {
+func newApplyPostBattleResponse(res corebattle.PartyBattleResult) ApplyPostBattleResponse {
 	return ApplyPostBattleResponse{
 		UpdatedCharacters: make(map[string]corecharacter.Character),
 		GainedExperience:  make(map[string]int),
@@ -419,52 +343,6 @@ func newApplyPostBattleResponse() ApplyPostBattleResponse {
 		DepotDeliveries:   make(map[string][]coreitem.Instance),
 		LostDrops:         make(map[string][]coreitem.Instance),
 		ConsumedItems:     make(map[string][]corebattle.ConsumedItem),
+		RemainingStatus:   res.RemainingStatus,
 	}
-}
-
-func (s *Service) deliverToDepot(
-	ctx context.Context,
-	charID string,
-	char corecharacter.Character,
-	items []coreitem.Instance,
-	resp *ApplyPostBattleResponse,
-) error {
-	if len(items) == 0 {
-		return nil
-	}
-	if s.depotRepo == nil {
-		resp.LostDrops[charID] = append(resp.LostDrops[charID], items...)
-		return nil
-	}
-
-	dep, err := s.depotRepo.FindByCharacterIDForUpdate(ctx, charID)
-	if errors.Is(err, depot.ErrNotFound) {
-		dep, err = depot.NewDepotWithCapacity(charID, char.JobLevel, 0, char.OverDepot)
-		if err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	}
-
-	var delivered []coreitem.Instance
-	var lost []coreitem.Instance
-	for _, inst := range items {
-		if err := dep.AddItem(inst); err == nil {
-			delivered = append(delivered, inst)
-		} else {
-			lost = append(lost, inst)
-		}
-	}
-
-	if len(delivered) > 0 {
-		if err := s.depotRepo.Save(ctx, dep); err != nil {
-			return err
-		}
-		resp.DepotDeliveries[charID] = append(resp.DepotDeliveries[charID], delivered...)
-	}
-	if len(lost) > 0 {
-		resp.LostDrops[charID] = append(resp.LostDrops[charID], lost...)
-	}
-	return nil
 }
