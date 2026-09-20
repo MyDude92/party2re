@@ -103,16 +103,10 @@ func (s *Service) ExchangePrize(ctx context.Context, characterID string, costCoi
 			}
 		}
 
-		dep, err := s.depotRepo.FindByCharacterIDForUpdate(txCtx, characterID)
-		if errors.Is(err, depot.ErrNotFound) {
-			dep, err = depot.NewDepotWithCapacity(characterID, char.JobLevel, 0, char.OverDepot)
-			if err != nil {
-				return err
-			}
-		} else if err != nil {
+		dep, err := depot.FindOrCreate(txCtx, s.depotRepo, char)
+		if err != nil {
 			return err
 		}
-		dep.RefreshCapacity(char.JobLevel, char.OverDepot)
 
 		acc, err := s.repo.GetAccountForUpdate(txCtx, characterID)
 		if err != nil {
