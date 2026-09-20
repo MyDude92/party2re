@@ -51,6 +51,16 @@ func (r *CharacterRepository) Save(ctx context.Context, value corecharacter.Char
 		memoryJobID, memorySP, memoryOldJobID, memoryOldSP, value.SmallMedals, value.HelpCount, value.HeroCount, value.PvPWins,
 		value.Orb, value.Tired, value.OverLevel, value.OverDepot, value.OverMonster, value.OverFuture, value.OverFlea, value.OverStore, color,
 		value.Deposit, value.Crystal, value.WeaponSeal, value.WeaponCustomName, value.ArmorCustomName)
+	if err != nil {
+		return err
+	}
+
+	// Auto-initialize character_depots row for newly created character
+	_, err = ExecutorFromContext(ctx, r.db).ExecContext(ctx, `
+		INSERT INTO character_depots (character_id, capacity, ex_depot)
+		VALUES (?, 5, 0)
+		ON DUPLICATE KEY UPDATE capacity = capacity
+	`, value.ID)
 	return err
 }
 
